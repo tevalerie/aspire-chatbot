@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 from fastapi import (
     APIRouter,
     Depends,
     File,
     Form,
+    Header,
     HTTPException,
     Request,
     Response,
@@ -69,36 +71,59 @@ def _require_native(profile) -> None:
         raise HTTPException(status_code=503, detail=_UNCAST)
 
 
-async def require_voice_principal(
-    principal: Principal | None = Depends(chat_principal),
-) -> Principal:
-    """A verified caller, or 401.
+@dataclass(frozen=True, slots=True)
+class VoiceCaller:
+    """Who is spending the voice budget, and the bucket it counts against.
 
-    All three of these endpoints were open. No principal, no Authorization
-    header read, and the client sent none -- so anybody at all could spend the
-    programme's ElevenLabs budget, and the only brake was a window keyed on a
-    thread id they supplied themselves.
+    `key` is derived from a SIGNED token in both cases and is never anything the
+    caller chose. That is the whole property this type exists to hold.
+    """
+
+    key: str
+    #: None for a reader who has not signed in.
+    user_id: str | None
+
+
+async def require_voice_caller(
+    authorization: str | None = Header(default=None),
+    principal: Principal | None = Depends(chat_principal),
+) -> VoiceCaller:
+    """A caller whose spend can be attributed, or 401.
+
+    All three of these endpoints were once open: no principal, no Authorization
+    header read, and the only brake a window keyed on a thread id the caller
+    supplied themselves. Locking them to an account fixed that and broke
+    something else -- a signed-out visitor holds a `/v2/session` GRAPH token,
+    which is a different type from an account token, so every guest got 401
+    while the product told them otherwise. `/api/voice/config` advertises a
+    `guest` voice in three languages and the composer says "hold Space to
+    talk", against an API that refused them.
+
+    So both tokens are accepted, and the budget is bucketed by whichever one
+    arrived. A signed-out reader is bucketed by their SESSION id, taken from
+    inside the signed token -- not from a body field, not from the socket
+    address. Minting a session is itself rate limited (`session_mint_rate_limit`
+    in `api/stream.py`), so the number of distinct buckets one visitor can open
+    is bounded, which is what stops "a new session is a new budget" from being
+    the old thread-id hole in new clothes.
 
     `chat_principal` rather than `optional_principal`: it allows the same grace
     on a just-expired token that chat does, so a reader mid-conversation is not
     cut off from the microphone for a few seconds of clock skew.
     """
-    if principal is None:
-        raise HTTPException(
-            status_code=401, detail="A valid session is required to use voice."
-        )
-    return principal
+    if principal is not None:
+        return VoiceCaller(key=f"u:{principal.user_id}", user_id=str(principal.user_id))
 
+    from app.auth import bearer_token
+    from app.graph.identity import decode_session_token
 
-def _session_key(principal: Principal) -> str:
-    """Bucket for rate limiting: the account, which the caller cannot choose.
+    claims = decode_session_token(bearer_token(authorization))
+    if claims is not None and claims.session_id:
+        return VoiceCaller(key=f"s:{claims.session_id}", user_id=None)
 
-    It used to be `thread:{thread_id}` off a form field, falling back to the raw
-    socket address -- so a new thread id per request was a new budget, and the
-    fallback ignored X-Forwarded-For and bucketed every reader behind the proxy
-    as one.
-    """
-    return f"u:{principal.user_id}"
+    raise HTTPException(
+        status_code=401, detail="A valid session is required to use voice."
+    )
 
 
 def _base_mime(raw: str | None) -> str:
@@ -151,7 +176,7 @@ async def transcribe(
     language: str | None = Form(default=None),
     persona: str | None = Form(default=None),
     thread_id: str | None = Form(default=None),
-    principal: Principal = Depends(require_voice_principal),
+    caller: VoiceCaller = Depends(require_voice_caller),
 ) -> TranscriptionResponse:
     settings = get_voice_settings()
 
@@ -188,7 +213,7 @@ async def transcribe(
             detail=f"Audio is longer than the {settings.max_duration_seconds:.0f} second limit.",
         )
 
-    decision = get_limiter().check_transcription(_session_key(principal))
+    decision = get_limiter().check_transcription(caller.key)
     if not decision.allowed:
         raise HTTPException(
             status_code=429,
@@ -239,7 +264,7 @@ async def transcribe(
 async def speak(
     request: Request,
     body: SpeakRequest,
-    principal: Principal = Depends(require_voice_principal),
+    caller: VoiceCaller = Depends(require_voice_caller),
 ) -> Response:
     """Text to audio."""
     with timed_turn(
@@ -247,10 +272,10 @@ async def speak(
         persona=body.persona.value,
         lang=body.language.value,
     ):
-        return await _speak(request, body, principal)
+        return await _speak(request, body, caller)
 
 
-async def _speak(request: Request, body: SpeakRequest, principal: Principal) -> Response:
+async def _speak(request: Request, body: SpeakRequest, caller: VoiceCaller) -> Response:
     settings = get_voice_settings()
 
     if body.format.lower() != "mp3":
@@ -276,7 +301,7 @@ async def _speak(request: Request, body: SpeakRequest, principal: Principal) -> 
     # touching the limiter, so a caller who kept asking for the same line was
     # never counted at all -- and the cache is shared, so the line only has to
     # be warm for somebody, not for them.
-    decision = get_limiter().check_speech(_session_key(principal))
+    decision = get_limiter().check_speech(caller.key)
     if not decision.allowed:
         raise HTTPException(
             status_code=429,
@@ -321,7 +346,7 @@ async def _speak(request: Request, body: SpeakRequest, principal: Principal) -> 
 async def speak_stream(
     request: Request,
     body: SpeakRequest,
-    principal: Principal = Depends(require_voice_principal),
+    caller: VoiceCaller = Depends(require_voice_caller),
 ) -> Response:
     """Text to audio, with the first byte sent before the last is synthesised."""
     with timed_turn(
@@ -362,7 +387,7 @@ async def speak_stream(
         # Metered before the cache is read, as in `_speak`. This one mattered
         # more: the hit returned above the limiter entirely, so replaying a warm
         # line was free and uncounted however many times it was asked for.
-        decision = get_limiter().check_speech(_session_key(principal))
+        decision = get_limiter().check_speech(caller.key)
         if not decision.allowed:
             raise HTTPException(
                 status_code=429,

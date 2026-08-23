@@ -108,11 +108,10 @@ def client(settings, sdk, monkeypatch) -> TestClient:
     # test below about the thing it was written for -- consent, MIME, limits,
     # the breaker -- rather than about carrying a token. That the 401 itself
     # works is asserted separately, on a client without the override.
-    app.dependency_overrides[router_module.require_voice_principal] = (
-        lambda: Principal(
-            user_id=uuid.UUID("00000000-0000-4000-8000-00000000beef"),
-            account_type="registered",
-            session_epoch=1,
+    app.dependency_overrides[router_module.require_voice_caller] = (
+        lambda: router_module.VoiceCaller(
+            key="u:00000000-0000-4000-8000-00000000beef",
+            user_id="00000000-0000-4000-8000-00000000beef",
         )
     )
     yield TestClient(app)
@@ -427,3 +426,128 @@ def test_a_cache_hit_is_still_metered(client, settings, monkeypatch):
     assert refused.status_code == 429, (
         "a cached line was served without touching the limiter"
     )
+
+
+# --- who may spend the voice budget --------------------------------------
+
+
+class TestASignedOutReaderMayUseVoice:
+    """`/api/voice/config` advertises a guest voice; the API used to refuse it."""
+
+    @staticmethod
+    def _graph_token(session_id="t-abc123def456", **over):
+        from app.graph.identity import mint_session_token
+
+        claims = dict(
+            session_id=session_id,
+            user_id=None,
+            device_id="dev",
+            persona="guest",
+            age_band="16-18",
+            account_status="prospect",
+            locale="en",
+            identity_proven=False,
+        )
+        claims.update(over)
+        return mint_session_token(**claims)
+
+    def test_a_graph_session_token_is_accepted(self, anonymous_client):
+        response = anonymous_client.post(
+            "/api/voice/speak",
+            json={"text": "Hello.", "language": "en", "persona": "guest", "format": "mp3"},
+            headers={"authorization": f"Bearer {self._graph_token()}"},
+        )
+        assert response.status_code != 401, (
+            "a signed-out reader holds a graph token, not an account token -- "
+            "refusing it is what made every guest see 'Voice is offline'"
+        )
+
+    def test_no_token_is_still_refused(self, anonymous_client):
+        response = anonymous_client.post(
+            "/api/voice/speak",
+            json={"text": "Hello.", "language": "en", "persona": "guest", "format": "mp3"},
+        )
+        assert response.status_code == 401
+
+    def test_a_forged_token_is_still_refused(self, anonymous_client):
+        response = anonymous_client.post(
+            "/api/voice/speak",
+            json={"text": "Hello.", "language": "en", "persona": "guest", "format": "mp3"},
+            headers={"authorization": "Bearer not.a.real.token"},
+        )
+        assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+class TestTheBudgetBucketIsNeverChosenByTheCaller:
+    """The property the whole change turns on."""
+
+    async def test_a_guest_is_bucketed_by_the_signed_session_id(self):
+        from app.graph.identity import mint_session_token
+        from app.voice.router import require_voice_caller
+
+        token = mint_session_token(
+            session_id="t-abc123def456",
+            user_id=None,
+            device_id="d",
+            persona="guest",
+            age_band="16-18",
+            account_status="prospect",
+            locale="en",
+            identity_proven=False,
+        )
+        caller = await require_voice_caller(
+            authorization=f"Bearer {token}", principal=None
+        )
+        assert caller.key == "s:t-abc123def456"
+        assert caller.user_id is None
+
+    async def test_an_account_is_still_bucketed_by_the_account(self):
+        import uuid as _uuid
+
+        from app.voice.router import require_voice_caller
+
+        principal = Principal(
+            user_id=_uuid.UUID("00000000-0000-4000-8000-00000000beef"),
+            account_type="registered",
+            session_epoch=1,
+        )
+        caller = await require_voice_caller(authorization=None, principal=principal)
+        assert caller.key.startswith("u:")
+        assert caller.user_id is not None
+
+    async def test_an_account_wins_over_a_graph_token(self):
+        """Signing in should not silently downgrade you to the guest bucket."""
+        import uuid as _uuid
+
+        from app.graph.identity import mint_session_token
+        from app.voice.router import require_voice_caller
+
+        token = mint_session_token(
+            session_id="t-abc123def456",
+            user_id=None,
+            device_id="d",
+            persona="guest",
+            age_band="16-18",
+            account_status="prospect",
+            locale="en",
+            identity_proven=False,
+        )
+        caller = await require_voice_caller(
+            authorization=f"Bearer {token}",
+            principal=Principal(
+                user_id=_uuid.UUID("00000000-0000-4000-8000-00000000beef"),
+                account_type="registered",
+                session_epoch=1,
+            ),
+        )
+        assert caller.key.startswith("u:")
+
+    async def test_nothing_at_all_raises_401(self):
+        from fastapi import HTTPException
+
+        from app.voice.router import require_voice_caller
+
+        with pytest.raises(HTTPException) as raised:
+            await require_voice_caller(authorization=None, principal=None)
+        assert raised.value.status_code == 401
