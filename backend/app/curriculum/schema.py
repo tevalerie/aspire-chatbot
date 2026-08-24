@@ -258,13 +258,31 @@ class Lesson(_Node):
         """
         voice = self.persona_voice.get(persona or "")
         if voice is not None and voice.teach_points:
-            return list(voice.teach_points)
+            # A voice is authored AT a band (orion's at 13-15). A reader ABOVE
+            # that band -- Zion's second rung, 16-18 -- outgrows the voice text
+            # and takes the band map instead, where the older wording lives.
+            # Without this, a seventeen-year-old was taught in the 13-15 voice.
+            outgrown = (
+                voice.band is not None
+                and band_index(band) > band_index(voice.band)
+                and for_band(self.teach_points, band) is not None
+            )
+            if not outgrown:
+                return list(voice.teach_points)
         return list(for_band(self.teach_points, band) or [])
 
     def examples_for(self, band: str, persona: str | None = None) -> list[str]:
         voice = self.persona_voice.get(persona or "")
         if voice is not None and voice.examples:
-            return list(voice.examples)
+            # Same rung rule as `teach_for`: a reader above the voice's band
+            # takes the band map's older examples.
+            outgrown = (
+                voice.band is not None
+                and band_index(band) > band_index(voice.band)
+                and for_band(self.examples, band) is not None
+            )
+            if not outgrown:
+                return list(voice.examples)
         return list(for_band(self.examples, band) or [])
 
     def joke_for(self, persona: str | None) -> str | None:
